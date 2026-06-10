@@ -1,0 +1,2 @@
+import SmartManufacturingSuite
+print(SmartManufacturingSuite.__file__)
