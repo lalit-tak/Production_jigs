@@ -1,0 +1,22 @@
+________________________________________________________________________________
+                              Test Results Summary                              
+
+Cellular Test:                                          ✅ Success ✅ (took 9.68s)
+	├ IMEI: 865044073805139
+	├ IMSI: 405540458893800
+	├ RSRP: -79 dBm
+	├ RSRQ: -13 dB
+	└ Valid Signal Measurements: Yes
+SIM Test:                                               ✅ Success ✅ (took 3.79s)
+	└ IMSI: 405540468117043
+External Flash Test:                                    ✅ Success ✅ (took 0.79s)
+RF Test:                                               ✅ Success ✅ (took 10.91s)
+	├ RX RSSI: -29 dBm
+	└ TX RSSI: -29 dBm
+________________________________________________________________________________
+
+Total Testing Time: 25.17 seconds
+
+Overall Test Result: ✅ SUCCESS ✅
+
+

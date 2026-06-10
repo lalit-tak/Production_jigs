@@ -1,0 +1,19 @@
+# COM Port Configuration for Smart Manufacturing Suite
+# Format: KEY=VALUE
+
+# Scanner COM Ports (for serial number scanning)
+SCANNER_COM1=COM30
+SCANNER_COM2=COM24
+SCANNER_COM3=COM30
+SCANNER_COM4=COM24
+
+# Optical COM Ports (for testing)
+OPTICAL_COM1=COM1
+OPTICAL_COM2=COM2
+OPTICAL_COM3=COM3
+OPTICAL_COM4=COM4
+
+# Test Configuration
+MAX_RETRIES=2
+TEST_TIMEOUT=15
+RETRY_DELAY=2

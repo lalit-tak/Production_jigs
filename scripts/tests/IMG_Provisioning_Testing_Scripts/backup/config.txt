@@ -1,0 +1,4 @@
+previous gateway id = IMG25000024
+current gateway id = IMG25000025
+previous sink id = 25000024
+current sink id = 25000025
