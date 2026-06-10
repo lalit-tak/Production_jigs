@@ -1,0 +1,5 @@
+{
+    "RX_RSSI_THRESHOLD_DBM": -50,
+    "TX_RSSI_THRESHOLD_DBM": -50
+  }
+  

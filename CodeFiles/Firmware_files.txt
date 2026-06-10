@@ -1,0 +1,2 @@
+Flash_firmware=final_image_test_app_1_7_0.hex
+Main_firmware=final_image_nic_app_fg23_flash_ch1_7_0_0_0.hex

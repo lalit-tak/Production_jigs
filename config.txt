@@ -1,0 +1,10 @@
+# COM Port Configuration for Manufacturing Test Stations
+# Format: station_number=COM_port
+# Lines starting with # are comments
+
+1=COM16
+2=COM3
+3=COM7
+4=COM4
+5=COM6
+6=COM5
