@@ -1,0 +1,23 @@
+{
+    "SCANNER_COM1": "COM136",
+    "SCANNER_COM2": "COM134",
+    "SCANNER_COM3": "COM133",
+    "SCANNER_COM4": "COM135",
+    "OPTICAL_COM1": "COM136",
+    "OPTICAL_COM2": "COM134",
+    "OPTICAL_COM3": "COM133",
+    "OPTICAL_COM4": "COM135",
+    "DAC_COM": "USB-4704,BID#0",
+    "MAX_RETRIE": 2,
+    "TEST_TIMEOUT": 15,
+    "RETRY_DELA": 2,
+    "Firmware_version": "4.2.0.0",
+    "min_Boost_voltage": 3.65,
+    "max_Boost_voltage": 4.2,
+    "min_Dis_super_cap_voltage": -0.2,
+    "max_Dis_super_cap_voltage": 0.5,
+    "min_super_cap_voltage": 1.6,
+    "max_super_cap_voltage": 2.7,
+    "min_Discharge_voltage": 0,
+    "max_Discharge_voltage": 3.0
+}
