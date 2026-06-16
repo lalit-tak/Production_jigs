@@ -1,0 +1,17 @@
+{
+    "SCANNER_COM1": "COM5",
+    "SCANNER_COM2": "COM6",
+    "OPTICAL_COM1": "COM4",
+    "OPTICAL_COM2": "COM131",
+    "MAX_RETRIES": 2,
+    "TEST_TIMEOUT": 50,
+    "RETRY_DELAY": 2,
+    "Firmware_version": "1111_0032",
+    "Gang_Programming_Code_File": "firmware_flash_files//5_6_3Ph_GangConfig.cfg",
+    "Bootloader_Firmware": "3PLTCT25_V4.9_bootloader.bin",
+    "Main_firmware": "3PLTCT26_UP_FW_V1111_0032_main_fw.bin",
+    "Gang_Programming_Station_Map": {
+        "Station1": "#5",
+        "Station2": "#6"
+    }
+}
