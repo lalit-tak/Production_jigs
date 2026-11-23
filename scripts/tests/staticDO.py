@@ -42,9 +42,8 @@ $NoKeywords:  $
 ******************************************************************************/
 """
 import sys, os
-# sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
 
-# from scripts.Automation.BDaq import *
 from scripts.Automation.BDaq import *
 from scripts.Automation.BDaq.InstantDoCtrl import InstantDoCtrl
 from scripts.Automation.BDaq.BDaqApi import AdxEnumToString, BioFailed
@@ -81,7 +80,6 @@ def AdvInstantDO(inputVal, deviceDescription):
         ret = instantDoCtrl.writeAny(startPort, portCount, dataBuffer)
         if BioFailed(ret):
             break
-        # print("DO output completed!")
         ans = "DO output completed!"
 
     # Step 3: Close device and release any allocated resource.
@@ -90,27 +88,17 @@ def AdvInstantDO(inputVal, deviceDescription):
     # If something wrong in this execution, print the error code on screen for tracking.
     if BioFailed(ret):
         enumStr = AdxEnumToString("ErrorCode", ret.value, 256)
-        # print("Some error occurred. And the last error code is %#x. [%s]" % (ret.value, enumStr))
         ans = "Some error occurred. And the last error code is %#x. [%s]" % (ret.value, enumStr)
     return ans
 
 
+
 # if __name__ == "__main__":
-def run_staticDO(inputVal = 0, deviceDescription = "USB-4716,BID#0"):
-    # ans = "Some error occurred"
-    # print("static file called")
-    # parser = argparse.ArgumentParser()
-    # parser.add_argument("--inputVal", required=True, help="Input value passed from parent script")
-    
-    
-    # args = parser.parse_args()
-    # inputVal = args.inputVal 
-    
+def run_staticDO(inputVal, deviceDescription = 'USB-4716,BID#0'):
     # Access the passed value
     print("Received input:", inputVal)
-    print("Dec Card ID: ", deviceDescription)
-
+    output = ""
     # print("DO output completed! dack card")
-    # return "DO output completed!"
-    ans = AdvInstantDO(inputVal, deviceDescription)
-    return ans
+    output = AdvInstantDO(inputVal, deviceDescription)
+    print("Output from AdvInstantDO:", output)
+    return output

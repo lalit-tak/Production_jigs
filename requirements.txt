@@ -1,0 +1,27 @@
+# Smart Manufacturing Suite - IMG Stage 1 (Deck 1)
+# Tested with Python 3.12 on Windows 11. Install with: pip install -r requirements.txt
+# (tkinter ships with the standard Python installer for Windows.)
+
+# --- Serial / hardware ---
+pyserial==3.5            # barcode scanner + optical port communication
+pywin32==311             # win32gui / win32con / win32com / pythoncom (ResearchDownload window control)
+psutil==7.2.2            # process monitoring
+
+# --- GUI / reporting ---
+pillow==12.1.1           # logos and icons in the tkinter UI
+openpyxl==3.1.5          # per-batch Excel result workbooks
+
+# --- Config decryption (serial_config.enc) ---
+cryptography==46.0.5     # Fernet + PBKDF2HMAC
+
+# --- Cloud upload ---
+boto3==1.42.45           # S3 upload of logs and result workbooks
+
+# --- IMG provisioning/testing scripts (scripts/tests/IMG_Provisioning_Testing_Scripts) ---
+cbor2==5.8.0
+colorama==0.4.6
+python4yahdlc==1.3.5
+
+# --- Not on PyPI: Advantech DAQNavi driver (BDaq) ---
+# The BDaq Python wrapper is bundled in scripts/Automation/BDaq.
+# Install the Advantech DAQNavi / USB-4716 driver separately (see README.md).

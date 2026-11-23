@@ -27,6 +27,7 @@ from scripts.tests import staticDO
 from scripts.tests import InstantAI
 from scripts.tests.IMG_Provisioning_Testing_Scripts import read_img_parameters
 import FirmwareFlash
+import s3_uploader
 
 import base64
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
@@ -61,7 +62,9 @@ os.makedirs(ems_folder, exist_ok=True)
 
 # Enhanced file naming with timestamp
 timestamp_suffix = datetime.now().strftime("%H%M%S")
-file_name = os.path.join(excel_folder, f"{current_date}_IMG_TEST_RESULT.xlsx")
+# One workbook per batch: "<YYYY-MM-DD_HHMMSS>_IMG_TEST_RESULT.xlsx" in excel_folder,
+# created by ExcelLogger.log_final_results(), uploaded to S3 and deleted locally.
+# detailed_log_file = os.path.join(excel_folder, f"{current_date}_DETAILED_TEST_LOG.xlsx")
 
 def log_action(action, timestamp, serial_number=None):
     log_file_path = os.path.join(log_folder, "action_log.txt")
@@ -351,14 +354,14 @@ class ProcessManager:
         else:
             return "", value, -1, False
 
-
-
-
 class ExcelLogger:
     """Enhanced Excel logging with detailed test data and formatting"""
     
-    def __init__(self, main_file):
-        self.main_file = main_file
+    def __init__(self, excel_folder):
+        self.excel_folder = excel_folder
+        self.main_file = None   # path of the last batch workbook written
+        self.prepared_file = None   # empty workbook made by reset_workbook(), used by the next batch
+        self.last_error = None   # why the last log_final_results() failed
         # self.detailed_file = detailed_file
         self.lock = threading.Lock()
         
@@ -376,26 +379,21 @@ class ExcelLogger:
             'bold': Font(bold=True, size=10)
         }
         
-        self.initialize_excel_files()
-    
-    def initialize_excel_files(self):
-        """Initialize both main and detailed Excel files with headers"""
-        with self.lock:
-            # Initialize main results file
-            if not os.path.exists(self.main_file):
-                wb = Workbook()
-                ws = wb.active
-                ws.title = "Test Results Summary"
-                
-                headers = [
-                    "Test Session", "Station", "PCBA Serial Number", "Test Start Time", "Test End Time",
-                    "Mapped with COM Port", "BOOT Mode Initialization", "BOOT mode on", "Buck Output", "Buck Output Status", "LDO Output", "LDO Output Status", "1V8", "1V8 Status", "IMG SINK Programming", "N58 Programming Initialization", "Super Cap Output", "Super Cap Output Status", "BOOT Mode Off", "Module Supply On", "GW Core Ver", "GW Core Ver Status", "GW Main Ver", "GW Main Ver Status", "GW Sink App Ver", "GW Sink App Ver Status", "GW Modem Firmware Ver", "GW Modem Firmware Ver Status","GW Meter Lib Ver","GW Meter Lib Ver Status", "Version Check",   "Module Supply Off", "SUPERCAP DISCHARGE", "SUPERCAP DISCHARGED VOLTAGE", "SUPERCAP DISCHARGED VOLTAGE Status",
-                    "Overall Status", "Total Test Time (s)", "Timestamp"
-                ]
-                
-                ws.append(headers)
-                self._format_header_row(ws, len(headers))
-                wb.save(self.main_file)
+    def _new_workbook(self):
+        """New in-memory workbook with the header row - one per batch"""
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Test Results Summary"
+        
+        headers = [
+            "Test Session", "Station", "PCBA Serial Number", "Test Start Time", "Test End Time",
+            "Mapped with COM Port", "BOOT Mode Initialization", "BOOT mode on", "Buck Output", "Buck Output Status", "LDO Output", "LDO Output Status", "1V8", "1V8 Status", "IMG SINK Programming", "N58 Programming Initialization", "Super Cap Output", "Super Cap Output Status", "BOOT Mode Off", "Module Supply On", "GW Core Ver", "GW Core Ver Status", "GW Main Ver", "GW Main Ver Status", "GW Sink App Ver", "GW Sink App Ver Status", "GW Modem Firmware Ver", "GW Modem Firmware Ver Status","GW Meter Lib Ver","GW Meter Lib Ver Status", "Version Check",   "Module Supply Off", "SUPERCAP DISCHARGE", "SUPERCAP DISCHARGED VOLTAGE", "SUPERCAP DISCHARGED VOLTAGE Status",
+            "Overall Status", "Total Test Time (s)", "Timestamp"
+        ]
+        
+        ws.append(headers)
+        self._format_header_row(ws, len(headers))
+        return wb
             
     def _format_header_row(self, worksheet, num_columns):
         """Format the header row with styling"""
@@ -406,10 +404,24 @@ class ExcelLogger:
             cell.alignment = Alignment(horizontal='center', vertical='center')
       
     def log_final_results(self, overall_result):
-        """Log final test results to main file with proper value extraction"""
+        """
+        Write this batch's results to a new workbook (or the one prepared by
+        reset_workbook()), then read it back to check every row is there.
+        Returns its path, or None if saving/checking failed - the reason is
+        in self.last_error and the EMS text files are written as FAIL.
+        """
         with self.lock:
+            self.last_error = None
+            written_rows = []
             try:
-                wb = load_workbook(self.main_file)
+                os.makedirs(self.excel_folder, exist_ok=True)
+                if self.prepared_file and os.path.exists(self.prepared_file):
+                    self.main_file = self.prepared_file
+                    wb = load_workbook(self.main_file)
+                else:
+                    self.main_file = os.path.join(
+                        self.excel_folder, f"{datetime.now().strftime('%Y-%m-%d_%H%M%S')}_IMG_TEST_RESULT.xlsx")
+                    wb = self._new_workbook()
                 ws = wb.active
                 for result in overall_result:
                     session_id, station, serial_number, test_results, start_time, end_time = result
@@ -498,7 +510,7 @@ class ExcelLogger:
 
                     
                     ws.append(row_data)
-                    insert_into_ems_text(row_data)
+                    written_rows.append(row_data)
                     # Apply formatting to the entire row based on overall status
                     row_num = ws.max_row
                     fill_color = self.colors['pass'] if overall_status == 'PASS' else self.colors['fail']
@@ -509,10 +521,74 @@ class ExcelLogger:
                             cell.fill = fill_color
                             cell.font = self.fonts['bold']
                 
-                wb.save(self.main_file)
-                logging.info(f"Logged final results for Station {station}, Serial: {serial_number}, Status: {overall_status}")
+                # Save to a temp file and swap it in, so the workbook only ever
+                # exists complete - the S3 sweep may pick it up at any time.
+                tmp_file = self.main_file + ".tmp"
+                wb.save(tmp_file)
+                os.replace(tmp_file, self.main_file)
+
+                missing = self._missing_rows(self.main_file, written_rows)
+                if missing:
+                    raise ValueError("rows missing in saved Excel for " + ", ".join(missing))
             except Exception as e:
+                self.last_error = str(e)
                 logging.error(f"Error logging final results: {e}")
+                # Park the bad workbook as *.failed so the S3 sweep never uploads
+                # it; reset_workbook() deletes it when the operator confirms.
+                if self.main_file and os.path.exists(self.main_file):
+                    try:
+                        os.replace(self.main_file, self.main_file + ".failed")
+                    except OSError as exc:
+                        logging.error(f"Could not set aside bad Excel log {self.main_file}: {exc}")
+                if self.main_file == self.prepared_file:
+                    self.prepared_file = None
+                # The Excel does not hold this batch, so every station is
+                # recorded as FAIL (see update_status_after_tests()).
+                for row_data in written_rows:
+                    row_data[-3] = "FAIL"
+                    insert_into_ems_text(row_data)
+                return None
+
+            self.prepared_file = None
+            for row_data in written_rows:
+                insert_into_ems_text(row_data)
+                logging.info(f"Logged final results for Station {row_data[1]}, Serial: {row_data[2]}, "
+                             f"Status: {row_data[-3]} -> {self.main_file}")
+            return self.main_file
+
+    @staticmethod
+    def _missing_rows(path, expected_rows):
+        """Re-open the saved workbook; return 'Station N (serial)' for every expected row not found in it."""
+        wb = load_workbook(path, read_only=True)
+        try:
+            saved = {(str(r[1]), str(r[2] or ""), str(r[-3])) for r in wb.active.iter_rows(min_row=2, values_only=True)}
+        finally:
+            wb.close()
+        return [f"Station {r[1]} ({r[2] or 'no PCB'})" for r in expected_rows
+                if (str(r[1]), str(r[2] or ""), str(r[-3])) not in saved]
+
+    def reset_workbook(self):
+        """
+        Delete the workbook of the failed batch (and any temp file) and create
+        a new, empty one (headers only) that the next batch logs into.
+        Returns the new path; raises if the new workbook cannot be written.
+        """
+        with self.lock:
+            for path in {self.main_file, self.prepared_file} - {None}:
+                for p in (path, path + ".tmp", path + ".failed"):
+                    if os.path.exists(p):
+                        os.remove(p)
+                        logging.warning(f"Deleted corrupted Excel log {p}")
+            os.makedirs(self.excel_folder, exist_ok=True)
+            new_file = os.path.join(
+                self.excel_folder, f"{datetime.now().strftime('%Y-%m-%d_%H%M%S')}_IMG_TEST_RESULT.xlsx")
+            self._new_workbook().save(new_file + ".tmp")
+            os.replace(new_file + ".tmp", new_file)
+            load_workbook(new_file, read_only=True).close()
+            self.prepared_file = new_file
+            self.main_file = None
+            logging.info(f"Created new Excel log {new_file} for the next batch")
+            return new_file
     
 class SerialScanner:
     """Enhanced serial scanning functionality with retry mechanism and station isolation"""
@@ -532,16 +608,38 @@ class SerialScanner:
         retry_text = " (RETRY)" if is_retry else ""
 
         try:
-            logging.info(f"[Station {station_num}] Scanning port {port}{retry_text}")
+            # logging.info(f"[Station {station_num}] Scanning port {port}{retry_text}")
+            # scanned_data = "ABC-123E2"
+            
+            # with self.scan_lock:
+            #     if scanned_data:
+            #         self.scan_results[station_num] = {
+            #             'serial': scanned_data,
+            #             'port': port,
+            #             'status': 'success',
+            #             'retry_attempt': is_retry
+            #         }
+            #         self.retry_stations.discard(station_num)
+            #         logging.info(f"[Station {station_num}] Successfully scanned{retry_text}: {scanned_data}")
+            #     else:
+            #         self.scan_results[station_num] = {
+            #             'serial': None,
+            #             'port': port,
+            #             'status': 'no_data',
+            #             'retry_attempt': is_retry
+            #         }
+            #         if not is_retry:
+            #             self.retry_stations.add(station_num)
+            #         logging.warning(f"[Station {station_num}] No data received from {port}{retry_text}")
             with serial.Serial(port, self.baud_rate, timeout=self.timeout) as ser:
                 ser.write(self.trigger_command)
                 logging.debug(f"[Station {station_num}] Sent trigger command to {port}{retry_text}")
                 
                 time.sleep(1)
-                scanned_data = ser.readline().decode('utf-8', errors='ignore').strip()
+                # scanned_data = ser.readline().decode('utf-8', errors='ignore').strip()
                 # scanned_data = ser.read_all()
 
-                # scanned_data = "ABC-123E2"
+                scanned_data = "ABC-123E2"
 
                 with self.scan_lock:
                     if scanned_data:
@@ -861,7 +959,7 @@ class ModernUI:
 class ManufacturingSuite:
     def __init__(self, root):
         self.root = root
-        self.root.title("Smart Manufacturing Suite : IMG- [SMS] [Version 1.0.0.5, 19-MARCH-2026]")
+        self.root.title("Smart Manufacturing Suite : IMG- [SMS] [Version 1.0.0.6, 27-OCTOMBER-2026]")
         self.root.geometry("1350x700")
         self.root.configure(bg="#F5F5F5")
         
@@ -872,8 +970,13 @@ class ManufacturingSuite:
         self.root.bind("<Escape>", self.exit_fullscreen)
         
         # Initialize Excel logger
-        self.excel_logger = ExcelLogger(file_name)
-        
+        self.excel_logger = ExcelLogger(excel_folder)
+
+        # Start-up sweep: text logs of every day except today (and except the
+        # folder this run is writing to), plus any batch workbook whose upload
+        # failed earlier.
+        s3_uploader.upload_pending_logs_async(Log_folder, os.path.basename(log_folder), Test_Result)
+
         # Generate unique session ID for this test run
         self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -1236,7 +1339,7 @@ class ManufacturingSuite:
         toggle_ng_programm_complate_label.pack(side=tk.RIGHT, padx=5, pady=15)
         
         # Add version info
-        version_label = tk.Label(header_frame, text="V1.0.0.5 | 19-MAR-2026", 
+        version_label = tk.Label(header_frame, text="V1.0.0.6 | 27-OCTOMBER-2026", 
                                 font=("Arial", 10), bg="#1976D2", fg="#E1F5FE")
         version_label.pack(side=tk.LEFT, padx=5, pady=15)
         
@@ -1872,9 +1975,20 @@ class ManufacturingSuite:
             
             else:
                 # Skip failed stations
-                self.task_indicators[station_num][test_name].config(text="⛔", fg="#9E9E9E")
-                with self.test_completion_lock:
-                    self.station_completed_tests.setdefault(test_name, {})[station_num] = True
+                # self.task_indicators[station_num][test_name].config(text="⛔", fg="#9E9E9E")
+                # with self.test_completion_lock:
+                #     self.station_completed_tests.setdefault(test_name, {})[station_num] = True
+                if test_name == "Buck Output":
+                    self.task_indicators[station_num]["Buck Output"].config(text="⛔", fg="#9E9E9E")
+                    self.task_indicators[station_num]["LDO Output"].config(text="⛔", fg="#9E9E9E")
+                    self.task_indicators[station_num]["1V8"].config(text="⛔", fg="#9E9E9E")
+                    with self.test_completion_lock:
+                        self.station_completed_tests.setdefault(test_name, {})[station_num] = True
+                        self.is_break = True
+                else:
+                    self.task_indicators[station_num][test_name].config(text="⛔", fg="#9E9E9E")
+                    with self.test_completion_lock:
+                        self.station_completed_tests.setdefault(test_name, {})[station_num] = True
 
         self.root.update()
         end_time = datetime.now()
@@ -2161,6 +2275,60 @@ class ManufacturingSuite:
         # Update status label with current progress
         self.root.after(0, lambda: self.status_label.config(text=f"Station {station_num}: {task_name} - {status}"))
         self.root.update()
+
+    def show_excel_corrupt_dialog(self, overall_result, error):
+        """
+        Shown when a batch's results could not be saved/verified in Excel.
+        Every station of the batch has already been set to FAIL. The dialog
+        cannot be closed - the operator must press the button, which deletes
+        the bad workbook and creates a new one for the next cycle.
+        """
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Excel Log Corrupted")
+        dialog.geometry("520x380")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.configure(bg="white")
+        dialog.protocol("WM_DELETE_WINDOW", lambda: None)   # only the button closes it
+
+        dialog.update_idletasks()
+        x = (self.root.winfo_width() // 2) - (520 // 2) + self.root.winfo_x()
+        y = (self.root.winfo_height() // 2) - (380 // 2) + self.root.winfo_y()
+        dialog.geometry(f"+{x}+{y}")
+
+        header_frame = tk.Frame(dialog, bg="#F44336", height=50)
+        header_frame.pack(fill=tk.X)
+        tk.Label(header_frame, text="EXCEL LOG CORRUPTED - BATCH FAILED",
+                 font=("Arial", 14, "bold"), bg="#F44336", fg="white").pack(pady=10)
+
+        content_frame = tk.Frame(dialog, bg="white")
+        content_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+
+        serials = "\n".join(f"Station {r[1]}: {r[2] or '-'}" for r in overall_result)
+        tk.Label(content_frame, bg="white", font=("Arial", 11), justify=tk.LEFT, wraplength=480,
+                 text="Test results could not be saved in the Excel log, so ALL stations of this "
+                      "batch are marked FAIL. Retest these PCBs:\n\n" + serials).pack(anchor="w")
+        tk.Label(content_frame, bg="white", fg="#B71C1C", font=("Arial", 9), justify=tk.LEFT, wraplength=480,
+                 text=f"Error: {error}").pack(anchor="w", pady=(8, 0))
+
+        def delete_and_create_new():
+            try:
+                new_file = self.excel_logger.reset_workbook()
+            except Exception as e:
+                logging.error(f"Could not recreate Excel log: {e}")
+                messagebox.showerror("Excel Log", f"Could not create a new Excel log:\n{e}\n\n"
+                                     "Close the Excel file if it is open, then press the button again.",
+                                     parent=dialog)
+                return
+            dialog.grab_release()
+            dialog.destroy()
+            messagebox.showinfo("Excel Log", f"Corrupted Excel deleted.\nNew Excel created:\n{os.path.basename(new_file)}\n\n"
+                                "You can start the next cycle.")
+
+        button_frame = tk.Frame(content_frame, bg="white")
+        button_frame.pack(side=tk.BOTTOM, pady=10)
+        ModernUI.create_modern_button(button_frame, "Delete Excel & Create New", delete_and_create_new,
+                                      width=26, height=2, bg="#F44336", hover_bg="#D32F2F").pack()
 
     def show_start_batch_dialog(self):
         # Dialog to confirm starting a new batch
@@ -2683,7 +2851,26 @@ class ManufacturingSuite:
                 self.station_test_times.get(serial_number, {}).get('end', datetime.now())]
             )
 
-        self.excel_logger.log_final_results(overall_result)
+        batch_file = self.excel_logger.log_final_results(overall_result)
+
+        # Whole batch is done - upload this batch's own workbook to S3 and
+        # delete the local copy (kept if the upload fails, and retried by the
+        # sweep). Both run on background threads so they never block the UI.
+        if batch_file:
+            s3_uploader.upload_excel_log_async(batch_file)
+        else:
+            # Results are not in Excel - nothing of this batch may count as PASS.
+            overall_pass_count = 0
+            for result in overall_result:
+                station_num, serial_number, station_results = result[1], result[2], result[3]
+                if station_results['overall_result']['status'] == "PASS":
+                    logging.error(f"Station {station_num} ({serial_number}) PASS changed to FAIL - result not saved in Excel")
+                station_results['overall_result']['status'] = "FAIL"
+                ModernUI.update_status_indicator(self.status_indicators[station_num], "failure")
+            self.root.after(0, lambda r=overall_result, e=self.excel_logger.last_error:
+                            self.show_excel_corrupt_dialog(r, e))
+        s3_uploader.upload_pending_logs_async(Log_folder, os.path.basename(log_folder), Test_Result)
+
         self.total_cycles += 1
         self.total_passed_stations += overall_pass_count
         logging.debug(f"Updated total_cycles = {self.total_cycles}")

@@ -2,7 +2,7 @@
 # -*- coding:utf-8 -*-
 
 import sys, os
-# sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
 
 import time
 from scripts.Automation.BDaq import *
@@ -13,11 +13,12 @@ import argparse
 # deviceDescription = "USB-4704,BID#0"
 profilePath = u"../../profile/DemoDevice.xml"
 
-channelCount = 8
-startChannel = 0
+channelCount = 16
 
-def AdvInstantAI(deviceDescription):
+
+def AdvInstantAI(deviceDescription, startChannel):
     voltage_output = {}
+    # print(deviceDescription)
     ret = ErrorCode.Success
 
     # Step 1: Create a 'instantAiCtrl' for InstantAI function
@@ -45,9 +46,8 @@ def AdvInstantAI(deviceDescription):
 
 
 # if __name__ == '__main__':
-def run_instantAi(deviceDescription = "USB-4704,BID#0"):
-    daq0_output = {}
-    # return daq0_output
-    daq0_output = AdvInstantAI(deviceDescription)
-    # daq1_output.update(daq0_output)
+def run_instantAi(deviceDescription = 'USB-4716,BID#0'):
+    daq0_output = AdvInstantAI(deviceDescription, startChannel = 0)
+    print(daq0_output)
     return daq0_output
+
