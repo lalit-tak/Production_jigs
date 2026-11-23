@@ -12,6 +12,7 @@ import threading
 import pythoncom
 import json
 import logging
+import logging.handlers
 import sys
 import os
 import random
@@ -43,9 +44,11 @@ from scripts.tests import InstantAI
 # Get current date for folder naming and filename
 current_date = datetime.now().strftime("%Y-%m-%d")
 
-# Setup directories
-
-BASE_DIR = os.path.dirname(os.path.realpath(sys.argv[0]))
+# Setup directories — works correctly for both script and frozen .exe
+if getattr(sys, 'frozen', False):
+    BASE_DIR = os.path.dirname(sys.executable)          # next to the .exe
+else:
+    BASE_DIR = os.path.dirname(os.path.realpath(sys.argv[0]))
 
 Test_Result = os.path.join(BASE_DIR, "Test Result Excel File")
 Log_folder = os.path.join(BASE_DIR, "Log files")
@@ -71,12 +74,13 @@ def log_action(action, timestamp, serial_number=None):
         else:
             log_file.write(f"{timestamp} - {action}\n")
 
-logging.basicConfig(
-    filename=os.path.join(log_folder, f"{current_date}_program_log.txt"),
-    level=logging.DEBUG,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    encoding="utf-8"
+_log_file = os.path.join(log_folder, f"{current_date}_program_log.txt")
+_log_handler = logging.handlers.RotatingFileHandler(
+    _log_file, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
 )
+_log_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+logging.getLogger().setLevel(logging.INFO)
+logging.getLogger().addHandler(_log_handler)
 
 def _function_wrapper(func, queue, args, kwargs):
     try:
@@ -86,11 +90,14 @@ def _function_wrapper(func, queue, args, kwargs):
         queue.put(("error", str(e)))
 
 class ProcessManager:
-    """Enhanced process management with forced termination capabilities"""
-    
+    """Process management with a persistent worker pool for reduced spawn overhead."""
+
     def __init__(self):
         self.active_processes = {}
         self.process_lock = threading.Lock()
+        # Pre-warmed pool — workers are started once and reused across cycles
+        self._pool_workers = 4
+        self._executor = concurrent.futures.ProcessPoolExecutor(max_workers=self._pool_workers)
     
     def run_process_with_timeout(self, cmd, timeout, station_num, test_name):
         """Run a process with robust timeout and forced termination"""
@@ -225,77 +232,79 @@ class ProcessManager:
             logging.error(f"Station {station_num}: Error in force kill: {e}")
     
     def kill_station_processes(self, station_num):
-        """Kill all processes for a specific station"""
+        """Cancel the pending future for a specific station (best-effort)."""
         with self.process_lock:
-            if station_num in self.active_processes:
-                process_info = self.active_processes[station_num]
-                process = process_info['process']
-                test_name = process_info['test_name']
-                
-                logging.warning(f"Station {station_num}: Killing process for {test_name}")
-                self._force_kill_process_tree(process, station_num, test_name)
-                del self.active_processes[station_num]
-    
+            info = self.active_processes.pop(station_num, None)
+        if info and 'future' in info:
+            info['future'].cancel()
+            logging.warning(f"Station {station_num}: Cancelled future for {info.get('test_name', '?')}")
+
     def get_active_processes(self):
-        """Get information about active processes"""
+        """Return a snapshot of currently tracked futures."""
         with self.process_lock:
             return dict(self.active_processes)
-    
+
     def cleanup_all_processes(self):
-        """Clean up all active processes"""
+        """Cancel all pending futures and rebuild the pool."""
         with self.process_lock:
-            for station_num, process_info in list(self.active_processes.items()):
-                process = process_info['process']
-                test_name = process_info['test_name']
-                logging.warning(f"Station {station_num}: Cleaning up process for {test_name}")
-                self._force_kill_process_tree(process, station_num, test_name)
+            for station_num, info in list(self.active_processes.items()):
+                if 'future' in info:
+                    info['future'].cancel()
+                    logging.warning(f"Station {station_num}: Cancelled future for {info.get('test_name', '?')}")
             self.active_processes.clear()
+        self._rebuild_executor()
 
 
+
+    def _rebuild_executor(self):
+        """Replace the pool after a timeout to avoid stuck workers."""
+        try:
+            self._executor.shutdown(wait=False)
+        except Exception:
+            pass
+        self._executor = concurrent.futures.ProcessPoolExecutor(max_workers=self._pool_workers)
+        logging.info("ProcessPoolExecutor rebuilt after timeout.")
 
     def run_function_with_timeout(self, func, timeout, station_num, test_name, *args, **kwargs):
-
-        queue = multiprocessing.Queue()
-
-        process = multiprocessing.Process(
-            target=_function_wrapper,
-            args=(func, queue, args, kwargs)
-        )
-
+        """Submit work to the persistent pool — no per-call process spawn overhead."""
         start_time = time.time()
-        process.start()
+        logging.info(f"Station {station_num}: Starting {test_name} (timeout={timeout}s)")
+
+        try:
+            future = self._executor.submit(func, *args, **kwargs)
+        except Exception as e:
+            logging.error(f"Station {station_num}: Could not submit {test_name}: {e}")
+            return "", str(e), -1, False
 
         with self.process_lock:
             self.active_processes[station_num] = {
-                "process": process,
+                "future": future,
                 "start_time": start_time,
                 "test_name": test_name,
-                "timeout": timeout
+                "timeout": timeout,
             }
 
-        process.join(timeout)
-
-        if process.is_alive():
-            logging.error(f"Station {station_num}: {test_name} timed out")
-            process.terminate()
-            process.join()
-
+        try:
+            result = future.result(timeout=timeout)
+            elapsed = time.time() - start_time
+            logging.info(f"Station {station_num}: {test_name} done in {elapsed:.2f}s")
             with self.process_lock:
                 self.active_processes.pop(station_num, None)
+            return result if result else "", "", 0, False
 
+        except concurrent.futures.TimeoutError:
+            logging.error(f"Station {station_num}: {test_name} timed out after {timeout}s — rebuilding pool")
+            future.cancel()
+            self._rebuild_executor()
+            with self.process_lock:
+                self.active_processes.pop(station_num, None)
             return "", f"Function timed out after {timeout} seconds", -1, True
-        
-        status, value = queue.get() if not queue.empty() else ("error", "No result")
-        queue.close()
-        queue.join_thread()
 
-        with self.process_lock:
-            self.active_processes.pop(station_num, None)
-
-        if status == "success":
-            return value if value else "", "", 0, False
-        else:
-            return "", value, -1, False
+        except Exception as e:
+            logging.error(f"Station {station_num}: {test_name} raised exception: {e}")
+            with self.process_lock:
+                self.active_processes.pop(station_num, None)
+            return "", str(e), -1, False
 
 class ExcelLogger:
     """Enhanced Excel logging with detailed test data and formatting"""
@@ -321,22 +330,23 @@ class ExcelLogger:
         self.initialize_excel_files()
     
     def initialize_excel_files(self):
-        """Initialize both main and detailed Excel files with headers"""
+        """Initialize Excel file with headers, or load existing — keep in memory for the session."""
         with self.lock:
-            # Initialize main results file
+            headers = [
+                "Test Session", "Station", "PCBA Serial Number", "Test Start Time", "Test End Time",
+                "Mapped with COM Port", "BOOT Mode Initialization", "BOOT MODE ON", "Boost Output", "Boost Output Status", "Super Cap Voltage",  "Super Cap Voltage Status", "BOOT MODE OFF", "SUPERCAP DISCHARGE", "Discharge Output",  "Discharge Output Status", "Discharge Super Cap Voltage", "Discharge Super Cap Voltage Status", "MODULE SUPPLY OFF","Overall Status", "Total Test Time (s)", "Timestamp"
+            ]
             if not os.path.exists(self.main_file):
-                wb = Workbook()
-                ws = wb.active
-                ws.title = "Test Results Summary"
-                
-                headers = [
-                    "Test Session", "Station", "PCBA Serial Number", "Test Start Time", "Test End Time",
-                    "Mapped with COM Port", "BOOT Mode Initialization", "BOOT MODE ON", "Boost Output", "Boost Output Status", "Super Cap Voltage",  "Super Cap Voltage Status", "BOOT MODE OFF", "SUPERCAP DISCHARGE", "Discharge Output",  "Discharge Output Status", "Discharge Super Cap Voltage", "Discharge Super Cap Voltage Status", "MODULE SUPPLY OFF","Overall Status", "Total Test Time (s)", "Timestamp"
-                ]
-                
-                ws.append(headers)
-                self._format_header_row(ws, len(headers))
-                wb.save(self.main_file)
+                self._wb = Workbook()
+                self._ws = self._wb.active
+                self._ws.title = "Test Results Summary"
+                self._ws.append(headers)
+                self._format_header_row(self._ws, len(headers))
+                self._wb.save(self.main_file)
+            else:
+                # Reuse existing file — load once and keep open
+                self._wb = load_workbook(self.main_file)
+                self._ws = self._wb.active
     
     def _format_header_row(self, worksheet, num_columns):
         """Format the header row with styling"""
@@ -349,71 +359,65 @@ class ExcelLogger:
     # def log_final_results(self, session_id, station, serial_number, test_results, 
     #                      start_time, end_time):
     def log_final_results(self, overall_result):
-        """Log final test results to main file with proper value extraction"""
+        """Append cycle results to the in-memory workbook and flush once."""
         with self.lock:
             try:
-                wb = load_workbook(self.main_file)
-                ws = wb.active
                 for result in overall_result:
                     session_id, station, serial_number, test_results, start_time, end_time = result
-                    overall_status = test_results.get('overall_result').get('status', 'FAIL')
+                    overall_status = test_results.get('overall_result', {}).get('status', 'FAIL')
                     total_time = (end_time - start_time).total_seconds() if end_time and start_time else 0
                     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    
-                    # Extract individual test results with proper value handling
-                    COM_PORT_MAPPING = test_results.get('COM_PORT_MAPPING', {})
-                    STATIC_DO0_ON = test_results.get('BOOT Mode Initialization', {})
-                    BOOT_Mode = test_results.get('BOOT MODE ON', {})
-                    Instant_AI_Boost_Output = test_results.get("Boost Output", {})
+
+                    COM_PORT_MAPPING          = test_results.get('COM_PORT_MAPPING', {})
+                    STATIC_DO0_ON             = test_results.get('BOOT Mode Initialization', {})
+                    BOOT_Mode                 = test_results.get('BOOT MODE ON', {})
+                    Instant_AI_Boost_Output   = test_results.get("Boost Output", {})
                     Instant_AI_Super_Cap_Voltage = test_results.get("Super Cap Voltage", {})
-                    BOOT_MODE_OFF = test_results.get('BOOT MODE OFF', {})
-                    SUPERCAP_DISCHARGE = test_results.get('SUPERCAP DISCHARGE', {})
-                    DISCHARGE_OUTPUT = test_results.get('DISCHARGE OUTPUT', {})
+                    BOOT_MODE_OFF             = test_results.get('BOOT MODE OFF', {})
+                    SUPERCAP_DISCHARGE        = test_results.get('SUPERCAP DISCHARGE', {})
+                    DISCHARGE_OUTPUT          = test_results.get('DISCHARGE OUTPUT', {})
                     Discharge_Super_Cap_Voltage = test_results.get('Discharge Super Cap Voltage', {})
-                    MODULE_SUPPLY_OFF = test_results.get('MODULE SUPPLY OFF', {})
-                    overall_station_status = test_results.get('overall_result', {})
-                    
+                    MODULE_SUPPLY_OFF         = test_results.get('MODULE SUPPLY OFF', {})
+                    overall_station_status    = test_results.get('overall_result', {})
 
                     row_data = [
                         session_id, station, serial_number,
                         start_time.strftime("%Y-%m-%d %H:%M:%S") if start_time else "",
                         end_time.strftime("%Y-%m-%d %H:%M:%S") if end_time else "",
                         COM_PORT_MAPPING.get('status', 'FAIL'),
-                        STATIC_DO0_ON.get('status','FAIL'),
-                        BOOT_Mode.get('status','FAIL'),
+                        STATIC_DO0_ON.get('status', 'FAIL'),
+                        BOOT_Mode.get('status', 'FAIL'),
                         Instant_AI_Boost_Output.get("value", 0),
                         Instant_AI_Boost_Output.get("status", "FAIL"),
                         Instant_AI_Super_Cap_Voltage.get("value", 0),
                         Instant_AI_Super_Cap_Voltage.get("status", "FAIL"),
-                        BOOT_MODE_OFF.get('status','FAIL'),
-                        SUPERCAP_DISCHARGE.get('status','FAIL'),
-                        DISCHARGE_OUTPUT.get('value',0),
-                        DISCHARGE_OUTPUT.get('status','FAIL'),
-                        Discharge_Super_Cap_Voltage.get('value',0),
+                        BOOT_MODE_OFF.get('status', 'FAIL'),
+                        SUPERCAP_DISCHARGE.get('status', 'FAIL'),
+                        DISCHARGE_OUTPUT.get('value', 0),
+                        DISCHARGE_OUTPUT.get('status', 'FAIL'),
+                        Discharge_Super_Cap_Voltage.get('value', 0),
                         Discharge_Super_Cap_Voltage.get('status', 'FAIL'),
-                        MODULE_SUPPLY_OFF.get('status','FAIL'),
-                        overall_station_status.get('status', 'FAIL')
+                        MODULE_SUPPLY_OFF.get('status', 'FAIL'),
+                        overall_station_status.get('status', 'FAIL'),
+                        f"{total_time:.2f}",
+                        timestamp,
                     ]
-                    # row_data.append(overall_status)
-                    row_data.append(f"{total_time:.2f}")
-                    row_data.append(timestamp)
 
+                    self._ws.append(row_data)
 
-                    
-                    ws.append(row_data)
-                    
-                    # Apply formatting to the entire row based on overall status
-                    row_num = ws.max_row
+                    # Colour the overall-status cell only (no full-row fill to keep save fast)
+                    row_num = self._ws.max_row
                     fill_color = self.colors['pass'] if overall_status == 'PASS' else self.colors['fail']
-                    
-                    for col in range(1, len(row_data) + 1):
-                        cell = ws.cell(row=row_num, column=col)
-                        if col == len(row_data) - 1:  # Overall status column
-                            cell.fill = fill_color
-                            cell.font = self.fonts['bold']
-                    
-                    logging.info(f"Logged final results for Station {station}, Serial: {serial_number}, Status: {overall_status}")
-                wb.save(self.main_file)
+                    status_col = len(row_data) - 1          # "Overall Status" column
+                    cell = self._ws.cell(row=row_num, column=status_col)
+                    cell.fill = fill_color
+                    cell.font = self.fonts['bold']
+
+                    logging.info(f"Logged results — Station {station} | Serial: {serial_number} | {overall_status}")
+
+                # Single disk write for all stations in this cycle
+                self._wb.save(self.main_file)
+
             except Exception as e:
                 logging.error(f"Error logging final results: {e}")
 
@@ -726,9 +730,10 @@ class ManufacturingSuite:
         self.max_retries = 1
         self.test_timeout = 60
         self.retry_delay = 2
-        self.PASSWORD = b"Polaris@1234"
+        self.PASSWORD = b"PUT_YOUR_ENC_ENCRYPTED_PASSWORD"
         self.ITERATIONS = 390000
-        self.CONFIG_FILE_NAME_ENC = "serial_config.enc"
+        # Config always lives next to the exe (or script) — never rely on CWD
+        self.CONFIG_FILE_NAME_ENC = os.path.join(BASE_DIR, "serial_config.enc")
 
         self.load_serial_config(self.CONFIG_FILE_NAME_ENC)
   
@@ -821,32 +826,27 @@ class ManufacturingSuite:
         return config
 
     def start_process_monitor(self):
-        """Start a background thread to monitor processes"""
+        """Background thread: cancel futures that exceed their timeout + 10 s grace."""
         def monitor_processes():
             while self.monitor_running:
                 try:
-                    active_processes = self.process_manager.get_active_processes()
-                    current_time = time.time()
-                    
-                    for station_num, process_info in active_processes.items():
-                        start_time = process_info['start_time']
-                        timeout = process_info['timeout']
-                        test_name = process_info['test_name']
-                        
-                        # Check if process has been running too long (timeout + 10 seconds grace period)
-                        if current_time - start_time > timeout + 10:
-                            logging.warning(f"Station {station_num}: Process {test_name} exceeded timeout by 10s, force killing")
+                    active = self.process_manager.get_active_processes()
+                    now = time.time()
+                    for station_num, info in active.items():
+                        grace = info.get('timeout', 60) + 10
+                        if now - info.get('start_time', now) > grace:
+                            logging.warning(
+                                f"Station {station_num}: {info.get('test_name','?')} "
+                                f"exceeded grace period — cancelling"
+                            )
                             self.process_manager.kill_station_processes(station_num)
-                            
-                            # Mark station as failed
                             self.failed_stations.add(station_num)
                             self.station_stop_flags[station_num] = True
-                    
-                    time.sleep(2)  # Check every 2 seconds
-                except Exception as e:
-                    logging.error(f"Error in process monitor: {e}")
                     time.sleep(2)
-        
+                except Exception as e:
+                    logging.error(f"Process monitor error: {e}")
+                    time.sleep(2)
+
         self.monitor_thread = threading.Thread(target=monitor_processes, daemon=True)
         self.monitor_thread.start()
 
@@ -1001,10 +1001,11 @@ class ManufacturingSuite:
         logo_frame = tk.Frame(header_frame, bg="#1976D2", width=200)
         logo_frame.pack(side=tk.LEFT, padx=20, pady=10)
         
-        # Try to load and display the logo
-        if os.path.exists("logo.png"):
+        # Try to load and display the logo (always next to exe/script)
+        _logo_path = os.path.join(BASE_DIR, "logo.png")
+        if os.path.exists(_logo_path):
             try:
-                original_image = Image.open("logo.png")
+                original_image = Image.open(_logo_path)
                 resized_image = original_image.resize((125, 40))
                 logo_image = ImageTk.PhotoImage(resized_image)
                 logo_label = tk.Label(logo_frame, image=logo_image, bg="#1976D2")
@@ -2148,7 +2149,6 @@ class ManufacturingSuite:
         self.status_label.config(text="Starting auto-scan for serial numbers...")
         self.auto_scan_all_serials()
         self.root.update()
-        time.sleep(1)
 
         # Count active stations and update status indicators
         valid_stations_to_test = []
@@ -2170,8 +2170,6 @@ class ManufacturingSuite:
         # Step 1: Map Serial Number with COM Ports
         self.gather_com_ports_serial_numbers()
         self.root.update()
-        time.sleep(0.5)
-
         self.make_default_dec_card_status()
 
         # Filter active_ports_serials to only include valid stations

@@ -42,19 +42,20 @@ $NoKeywords:  $
 ******************************************************************************/
 """
 import sys, os
-# sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
 
-# from scripts.Automation.BDaq import *
 from scripts.Automation.BDaq import *
 from scripts.Automation.BDaq.InstantDoCtrl import InstantDoCtrl
 from scripts.Automation.BDaq.BDaqApi import AdxEnumToString, BioFailed
-import argparse
 
-# deviceDescription = "DemoDevice,BID#0"
+def _get_profile_path():
+    """Resolve profile XML — works for both script and PyInstaller frozen exe."""
+    if getattr(sys, 'frozen', False):
+        # Frozen: PyInstaller extracts bundled files into sys._MEIPASS
+        return os.path.join(sys._MEIPASS, "scripts", "profile", "DemoDevice.xml")
+    # Script: two levels up from scripts/tests/ → project root → scripts/profile/
+    return os.path.join(os.path.dirname(__file__), "..", "profile", "DemoDevice.xml")
 
-# deviceDescription = "USB-4704,BID#0" # Replace with actual identifier
-
-profilePath = u"../../profile/DemoDevice.xml"
+profilePath = _get_profile_path()
 startPort = 0
 portCount = 1
 
