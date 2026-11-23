@@ -62,7 +62,7 @@ the `.exe` when built).
 
 ```powershell
 pip install pyinstaller
-pyinstaller --onefile --noconsole main.py
+pyinstaller --onefile main.py
 ```
 
 Place `serial_config.enc`, `firmware_flash_files/` and `scripts/profile/` next to the
