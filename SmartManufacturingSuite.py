@@ -71,12 +71,14 @@ def log_action(action, timestamp, serial_number=None):
         else:
             log_file.write(f"{timestamp} - {action}\n")
 
-logging.basicConfig(
-    filename=os.path.join(log_folder, f"{current_date}_program_log.txt"),
-    level=logging.DEBUG,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    encoding="utf-8"
+import logging.handlers as _log_handlers
+_log_file = os.path.join(log_folder, f"{current_date}_program_log.txt")
+_log_handler = _log_handlers.RotatingFileHandler(
+    _log_file, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
 )
+_log_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+logging.getLogger().setLevel(logging.INFO)
+logging.getLogger().addHandler(_log_handler)
 
 def _function_wrapper(func, queue, args, kwargs):
     try:
@@ -87,10 +89,20 @@ def _function_wrapper(func, queue, args, kwargs):
 
 class ProcessManager:
     """Enhanced process management with forced termination capabilities"""
-    
-    def __init__(self):
+
+    def __init__(self, max_workers=4):
         self.active_processes = {}
         self.process_lock = threading.Lock()
+        self._pool_workers = max_workers
+        self._executor = concurrent.futures.ProcessPoolExecutor(max_workers=self._pool_workers)
+
+    def _rebuild_executor(self):
+        try:
+            self._executor.shutdown(wait=False)
+        except Exception:
+            pass
+        self._executor = concurrent.futures.ProcessPoolExecutor(max_workers=self._pool_workers)
+        logging.info("ProcessPoolExecutor rebuilt after timeout.")
     
     def run_process_with_timeout(self, cmd, timeout, station_num, test_name):
         """Run a process with robust timeout and forced termination"""
@@ -225,16 +237,12 @@ class ProcessManager:
             logging.error(f"Station {station_num}: Error in force kill: {e}")
     
     def kill_station_processes(self, station_num):
-        """Kill all processes for a specific station"""
+        """Cancel the future for a specific station"""
         with self.process_lock:
-            if station_num in self.active_processes:
-                process_info = self.active_processes[station_num]
-                process = process_info['process']
-                test_name = process_info['test_name']
-                
-                logging.warning(f"Station {station_num}: Killing process for {test_name}")
-                self._force_kill_process_tree(process, station_num, test_name)
-                del self.active_processes[station_num]
+            info = self.active_processes.pop(station_num, None)
+        if info and 'future' in info:
+            info['future'].cancel()
+            logging.warning(f"Station {station_num}: Cancelled future for {info.get('test_name', '?')}")
     
     def get_active_processes(self):
         """Get information about active processes"""
@@ -242,60 +250,51 @@ class ProcessManager:
             return dict(self.active_processes)
     
     def cleanup_all_processes(self):
-        """Clean up all active processes"""
+        """Cancel all active futures and rebuild the executor"""
         with self.process_lock:
-            for station_num, process_info in list(self.active_processes.items()):
-                process = process_info['process']
-                test_name = process_info['test_name']
-                logging.warning(f"Station {station_num}: Cleaning up process for {test_name}")
-                self._force_kill_process_tree(process, station_num, test_name)
+            for info in self.active_processes.values():
+                if 'future' in info:
+                    info['future'].cancel()
             self.active_processes.clear()
+        self._rebuild_executor()
 
 
 
     def run_function_with_timeout(self, func, timeout, station_num, test_name, *args, **kwargs):
-
-        queue = multiprocessing.Queue()
-
-        process = multiprocessing.Process(
-            target=_function_wrapper,
-            args=(func, queue, args, kwargs)
-        )
-
         start_time = time.time()
-        process.start()
+        try:
+            future = self._executor.submit(func, *args, **kwargs)
+        except Exception as e:
+            logging.error(f"Station {station_num}: submit failed — {e}")
+            return "", str(e), -1, False
 
         with self.process_lock:
             self.active_processes[station_num] = {
-                "process": process,
+                "future": future,
                 "start_time": start_time,
                 "test_name": test_name,
-                "timeout": timeout
+                "timeout": timeout,
             }
 
-        process.join(timeout)
-
-        if process.is_alive():
-            logging.error(f"Station {station_num}: {test_name} timed out")
-            process.terminate()
-            process.join()
-
+        try:
+            result = future.result(timeout=timeout)
             with self.process_lock:
                 self.active_processes.pop(station_num, None)
+            return result if result else "", "", 0, False
 
+        except concurrent.futures.TimeoutError:
+            logging.error(f"Station {station_num}: {test_name} timed out after {timeout}s — rebuilding pool")
+            future.cancel()
+            self._rebuild_executor()
+            with self.process_lock:
+                self.active_processes.pop(station_num, None)
             return "", f"Function timed out after {timeout} seconds", -1, True
-        
-        status, value = queue.get() if not queue.empty() else ("error", "No result")
-        queue.close()
-        queue.join_thread()
 
-        with self.process_lock:
-            self.active_processes.pop(station_num, None)
-
-        if status == "success":
-            return value if value else "", "", 0, False
-        else:
-            return "", value, -1, False
+        except Exception as e:
+            logging.error(f"Station {station_num}: {test_name} exception — {e}")
+            with self.process_lock:
+                self.active_processes.pop(station_num, None)
+            return "", str(e), -1, False
 
 class ExcelLogger:
     """Enhanced Excel logging with detailed test data and formatting"""
@@ -318,25 +317,27 @@ class ExcelLogger:
             'bold': Font(bold=True, size=10)
         }
         
+        self._wb = None
+        self._ws = None
         self.initialize_excel_files()
-    
+
     def initialize_excel_files(self):
-        """Initialize both main and detailed Excel files with headers"""
+        """Load or create the workbook once at startup — never call load_workbook again."""
         with self.lock:
-            # Initialize main results file
+            headers = [
+                "Test Session", "Station", "PCBA Serial Number", "Test Start Time", "Test End Time",
+                "Mapped with COM Port", "BOOT Mode Initialization", "BOOT MODE ON", "Boost Output", "Boost Output Status", "Super Cap Voltage", "Super Cap Voltage Status", "BOOT MODE OFF", "SUPERCAP DISCHARGE", "Discharge Output", "Discharge Output Status", "Discharge Super Cap Voltage", "Discharge Super Cap Voltage Status", "MODULE SUPPLY OFF", "Overall Status", "Total Test Time (s)", "Timestamp"
+            ]
             if not os.path.exists(self.main_file):
-                wb = Workbook()
-                ws = wb.active
-                ws.title = "Test Results Summary"
-                
-                headers = [
-                    "Test Session", "Station", "PCBA Serial Number", "Test Start Time", "Test End Time",
-                    "Mapped with COM Port", "BOOT Mode Initialization", "BOOT MODE ON", "Boost Output", "Boost Output Status", "Super Cap Voltage",  "Super Cap Voltage Status", "BOOT MODE OFF", "SUPERCAP DISCHARGE", "Discharge Output",  "Discharge Output Status", "Discharge Super Cap Voltage", "Discharge Super Cap Voltage Status", "MODULE SUPPLY OFF","Overall Status", "Total Test Time (s)", "Timestamp"
-                ]
-                
-                ws.append(headers)
-                self._format_header_row(ws, len(headers))
-                wb.save(self.main_file)
+                self._wb = Workbook()
+                self._ws = self._wb.active
+                self._ws.title = "Test Results Summary"
+                self._ws.append(headers)
+                self._format_header_row(self._ws, len(headers))
+                self._wb.save(self.main_file)
+            else:
+                self._wb = load_workbook(self.main_file)   # load ONCE at startup
+                self._ws = self._wb.active
     
     def _format_header_row(self, worksheet, num_columns):
         """Format the header row with styling"""
@@ -346,74 +347,66 @@ class ExcelLogger:
             cell.font = self.fonts['header']
             cell.alignment = Alignment(horizontal='center', vertical='center')
     
-    # def log_final_results(self, session_id, station, serial_number, test_results, 
-    #                      start_time, end_time):
+    def _build_rows(self, overall_result):
+        """Build all row data outside the lock — pure dict lookups, no I/O."""
+        rows = []
+        for result in overall_result:
+            session_id, station, serial_number, test_results, start_time, end_time = result
+            overall_status = test_results.get('overall_result', {}).get('status', 'FAIL')
+            total_time = (end_time - start_time).total_seconds() if end_time and start_time else 0
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            COM_PORT_MAPPING = test_results.get('COM_PORT_MAPPING', {})
+            STATIC_DO0_ON = test_results.get('BOOT Mode Initialization', {})
+            BOOT_Mode = test_results.get('BOOT MODE ON', {})
+            Instant_AI_Boost_Output = test_results.get("Boost Output", {})
+            Instant_AI_Super_Cap_Voltage = test_results.get("Super Cap Voltage", {})
+            BOOT_MODE_OFF = test_results.get('BOOT MODE OFF', {})
+            SUPERCAP_DISCHARGE = test_results.get('SUPERCAP DISCHARGE', {})
+            DISCHARGE_OUTPUT = test_results.get('DISCHARGE OUTPUT', {})
+            Discharge_Super_Cap_Voltage = test_results.get('Discharge Super Cap Voltage', {})
+            MODULE_SUPPLY_OFF = test_results.get('MODULE SUPPLY OFF', {})
+            overall_station_status = test_results.get('overall_result', {})
+
+            row_data = [
+                session_id, station, serial_number,
+                start_time.strftime("%Y-%m-%d %H:%M:%S") if start_time else "",
+                end_time.strftime("%Y-%m-%d %H:%M:%S") if end_time else "",
+                COM_PORT_MAPPING.get('status', 'FAIL'),
+                STATIC_DO0_ON.get('status', 'FAIL'),
+                BOOT_Mode.get('status', 'FAIL'),
+                Instant_AI_Boost_Output.get("value", 0),
+                Instant_AI_Boost_Output.get("status", "FAIL"),
+                Instant_AI_Super_Cap_Voltage.get("value", 0),
+                Instant_AI_Super_Cap_Voltage.get("status", "FAIL"),
+                BOOT_MODE_OFF.get('status', 'FAIL'),
+                SUPERCAP_DISCHARGE.get('status', 'FAIL'),
+                DISCHARGE_OUTPUT.get('value', 0),
+                DISCHARGE_OUTPUT.get('status', 'FAIL'),
+                Discharge_Super_Cap_Voltage.get('value', 0),
+                Discharge_Super_Cap_Voltage.get('status', 'FAIL'),
+                MODULE_SUPPLY_OFF.get('status', 'FAIL'),
+                overall_station_status.get('status', 'FAIL'),
+                f"{total_time:.2f}",
+                timestamp,
+            ]
+            rows.append((row_data, overall_status, station, serial_number))
+        return rows
+
     def log_final_results(self, overall_result):
-        """Log final test results to main file with proper value extraction"""
+        """Log final test results — appends in memory, one save per cycle."""
+        rows = self._build_rows(overall_result)   # pure computation, no lock needed
         with self.lock:
             try:
-                wb = load_workbook(self.main_file)
-                ws = wb.active
-                for result in overall_result:
-                    session_id, station, serial_number, test_results, start_time, end_time = result
-                    overall_status = test_results.get('overall_result').get('status', 'FAIL')
-                    total_time = (end_time - start_time).total_seconds() if end_time and start_time else 0
-                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    
-                    # Extract individual test results with proper value handling
-                    COM_PORT_MAPPING = test_results.get('COM_PORT_MAPPING', {})
-                    STATIC_DO0_ON = test_results.get('BOOT Mode Initialization', {})
-                    BOOT_Mode = test_results.get('BOOT MODE ON', {})
-                    Instant_AI_Boost_Output = test_results.get("Boost Output", {})
-                    Instant_AI_Super_Cap_Voltage = test_results.get("Super Cap Voltage", {})
-                    BOOT_MODE_OFF = test_results.get('BOOT MODE OFF', {})
-                    SUPERCAP_DISCHARGE = test_results.get('SUPERCAP DISCHARGE', {})
-                    DISCHARGE_OUTPUT = test_results.get('DISCHARGE OUTPUT', {})
-                    Discharge_Super_Cap_Voltage = test_results.get('Discharge Super Cap Voltage', {})
-                    MODULE_SUPPLY_OFF = test_results.get('MODULE SUPPLY OFF', {})
-                    overall_station_status = test_results.get('overall_result', {})
-                    
-
-                    row_data = [
-                        session_id, station, serial_number,
-                        start_time.strftime("%Y-%m-%d %H:%M:%S") if start_time else "",
-                        end_time.strftime("%Y-%m-%d %H:%M:%S") if end_time else "",
-                        COM_PORT_MAPPING.get('status', 'FAIL'),
-                        STATIC_DO0_ON.get('status','FAIL'),
-                        BOOT_Mode.get('status','FAIL'),
-                        Instant_AI_Boost_Output.get("value", 0),
-                        Instant_AI_Boost_Output.get("status", "FAIL"),
-                        Instant_AI_Super_Cap_Voltage.get("value", 0),
-                        Instant_AI_Super_Cap_Voltage.get("status", "FAIL"),
-                        BOOT_MODE_OFF.get('status','FAIL'),
-                        SUPERCAP_DISCHARGE.get('status','FAIL'),
-                        DISCHARGE_OUTPUT.get('value',0),
-                        DISCHARGE_OUTPUT.get('status','FAIL'),
-                        Discharge_Super_Cap_Voltage.get('value',0),
-                        Discharge_Super_Cap_Voltage.get('status', 'FAIL'),
-                        MODULE_SUPPLY_OFF.get('status','FAIL'),
-                        overall_station_status.get('status', 'FAIL')
-                    ]
-                    # row_data.append(overall_status)
-                    row_data.append(f"{total_time:.2f}")
-                    row_data.append(timestamp)
-
-
-                    
-                    ws.append(row_data)
-                    
-                    # Apply formatting to the entire row based on overall status
-                    row_num = ws.max_row
+                for row_data, overall_status, station, serial_number in rows:
+                    self._ws.append(row_data)
+                    row_num = self._ws.max_row
                     fill_color = self.colors['pass'] if overall_status == 'PASS' else self.colors['fail']
-                    
-                    for col in range(1, len(row_data) + 1):
-                        cell = ws.cell(row=row_num, column=col)
-                        if col == len(row_data) - 1:  # Overall status column
-                            cell.fill = fill_color
-                            cell.font = self.fonts['bold']
-                    
-                    logging.info(f"Logged final results for Station {station}, Serial: {serial_number}, Status: {overall_status}")
-                wb.save(self.main_file)
+                    status_col = len(row_data) - 1   # Overall Status column
+                    self._ws.cell(row=row_num, column=status_col).fill = fill_color
+                    self._ws.cell(row=row_num, column=status_col).font = self.fonts['bold']
+                    logging.info(f"Logged results: Station {station}, Serial: {serial_number}, Status: {overall_status}")
+                self._wb.save(self.main_file)   # ONE disk write per cycle
             except Exception as e:
                 logging.error(f"Error logging final results: {e}")
 
@@ -777,9 +770,10 @@ class ManufacturingSuite:
         self.timer_running = False
         self.timer_id = None
 
-        # Cycle and pass counters
+        # Cycle and pass/fail counters
         self.total_cycles = 0
         self.total_passed_stations = 0
+        self.total_failed_stations = 0
         self.is_break = False
         
         # Station-specific test threads and control flags
@@ -1024,7 +1018,7 @@ class ManufacturingSuite:
 
         
         # Add version info
-        version_label = tk.Label(header_frame, text="V1.0.0.4 | 01-May-26", 
+        version_label = tk.Label(header_frame, text="V1.0.0.5 | 17-Jul-26",
                                 font=("Arial", 10), bg="#1976D2", fg="#E1F5FE")
         version_label.pack(side=tk.LEFT, padx=5, pady=15)
         
@@ -1171,9 +1165,21 @@ class ManufacturingSuite:
                                             bg="#E0E0E0", fg="#333", font=("Arial", 10 , "bold"))
         self.firmware_version_label.pack(side=tk.RIGHT, padx=10)
 
-        self.deck_card_count = tk.Label(status_frame, text=f"Deck Card Count: 1 - 16 CH", 
-                                            bg="#E0E0E0", fg="#333", font=("Arial", 10 , "bold"))
+        self.deck_card_count = tk.Label(status_frame, text=f"Deck Card Count: 1 - 16 CH",
+                                            bg="#E0E0E0", fg="#333", font=("Arial", 10, "bold"))
         self.deck_card_count.pack(side=tk.RIGHT, padx=10)
+
+        self.cycle_count_label = tk.Label(status_frame, text="Total Cycles: 0",
+                                            bg="#E0E0E0", fg="#333", font=("Arial", 10, "bold"))
+        self.cycle_count_label.pack(side=tk.RIGHT, padx=10)
+
+        self.pass_count_label = tk.Label(status_frame, text="Total Pass: 0",
+                                            bg="#E0E0E0", fg="#2E7D32", font=("Arial", 10, "bold"))
+        self.pass_count_label.pack(side=tk.RIGHT, padx=10)
+
+        self.fail_count_label = tk.Label(status_frame, text="Total Fail: 0",
+                                            bg="#E0E0E0", fg="#C62828", font=("Arial", 10, "bold"))
+        self.fail_count_label.pack(side=tk.RIGHT, padx=10)
 
     def gather_com_ports_serial_numbers(self):
         """Map serial numbers to COM ports with enhanced logging"""
@@ -2082,7 +2088,6 @@ class ManufacturingSuite:
         self.status_label.config(text="Starting auto-scan for serial numbers...")
         self.auto_scan_all_serials()
         self.root.update()
-        time.sleep(1)
 
         # Count active stations and update status indicators
         valid_stations_to_test = []
@@ -2104,7 +2109,6 @@ class ManufacturingSuite:
         # Step 1: Map Serial Number with COM Ports
         self.gather_com_ports_serial_numbers()
         self.root.update()
-        time.sleep(0.5)
 
         self.make_default_dec_card_status()
 
@@ -2223,22 +2227,28 @@ class ManufacturingSuite:
         self.excel_logger.log_final_results(overall_result)
         self.total_cycles += 1
         self.total_passed_stations += overall_pass_count
-        logging.debug(f"Updated total_cycles = {self.total_cycles}")
-        logging.debug(f"Updated total_passed_stations = {self.total_passed_stations}")
+        self.total_failed_stations += overall_fail_count
+        logging.info(f"Cycle {self.total_cycles} done — Pass: {self.total_passed_stations}, Fail: {self.total_failed_stations}")
 
-        # Update cycle and pass labels
+        # Update cycle / pass / fail labels
         try:
-            # if self.cycle_count_label:
-            #     self.cycle_count_label.config(text=f"Total Cycles: {self.total_cycles}")
-            #     self.cycle_count_label.update_idletasks()
-            # else:
-            #     logging.warning("cycle_count_label is None")
+            if self.cycle_count_label:
+                self.cycle_count_label.config(text=f"Total Cycles: {self.total_cycles}")
+                self.cycle_count_label.update_idletasks()
+            else:
+                logging.warning("cycle_count_label is None")
 
-            # if self.passed_stations_label:
-            #     self.passed_stations_label.config(text=f"Passed PCBA: {self.total_passed_stations}")
-            #     self.passed_stations_label.update_idletasks()
-            # else:
-            #     logging.warning("passed_stations_label is None")
+            if self.pass_count_label:
+                self.pass_count_label.config(text=f"Total Pass: {self.total_passed_stations}")
+                self.pass_count_label.update_idletasks()
+            else:
+                logging.warning("pass_count_label is None")
+
+            if self.fail_count_label:
+                self.fail_count_label.config(text=f"Total Fail: {self.total_failed_stations}")
+                self.fail_count_label.update_idletasks()
+            else:
+                logging.warning("fail_count_label is None")
 
             if self.status:
                 self.status.config(text="OFFLINE")

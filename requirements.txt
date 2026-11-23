@@ -1,0 +1,6 @@
+pyserial
+psutil
+openpyxl
+Pillow
+pywin32
+cryptography
