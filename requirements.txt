@@ -1,0 +1,15 @@
+# Better Meter Jig - Python dependencies (Windows, Python 3.8+)
+# Install with:  pip install -r requirements.txt
+
+PyQt5>=5.15          # operator UI (main.py, station_panel.py)
+pyserial>=3.5        # meter / scanner / RTC calibrator COM ports
+openpyxl>=3.1        # Excel test-result log (excel_logger.py)
+boto3>=1.28          # S3 upload of logs (s3_uploader.py)
+cryptography>=41.0   # decrypts serial_config.enc (station_config.py)
+
+# Only needed to build the standalone .exe (see Build/):
+# pyinstaller>=6.0
+
+# Not installable via pip (see README.md > Prerequisites):
+#  - Advantech DAQNavi driver (USB-4716), used through scripts/Automation/BDaq
+#  - Gang programmer DLLs, bundled in firmware_flash_files/
